@@ -34,9 +34,6 @@ let currentElement = null;
 let selectedElement = null;
 let offsetX = 0;
 let offsetY = 0;
-let isPanning = false;
-let startPanX = 0;
-let startPanY = 0;
 let scale = 1;
 const scaleFactor = 0.1;
 let startX, startY;
@@ -46,17 +43,6 @@ let redoStack = [];
 const maxHistorySize = 10;
 
 let isTeamCodePopupOpen = false;
-
-let isDragging = false;
-let dragOffsetX = 0;
-let dragOffsetY = 0;
-
-let animationFrameId = null;
-let lastTimestamp = 0;
-const ANIMATION_DURATION = 100; // in milliseconds
-let startDragPos = { x: 0, y: 0 };
-let targetPos = { x: 0, y: 0 };
-let isAnimating = false;
 
 const floatingTab = document.getElementById('floating-tab');
 const colorPalatebtn = document.getElementById('colorpalatebtn');
@@ -104,11 +90,17 @@ function drawGrid() {
     ctx.globalAlpha = 1;
 }
 
-// Add this event listener to track mouse movement
+// Initialize the optimized render loop from gestures.js
+initRenderLoop(redrawCanvas);
+
+// Update mouse position only, don't redraw immediately
 canvas.addEventListener('mousemove', (e) => {
     mouseX = e.offsetX;
     mouseY = e.offsetY;
-    redrawCanvas();
+    // For grid hover effect, we mark as dirty
+    if (!isDragging && !isDrawing) {
+        isDirty = true;
+    }
 });
 
 function resizeCanvas() {
@@ -286,8 +278,8 @@ zoomOut.addEventListener('click', () => {
 });
 
 canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
     if (e.ctrlKey) {
-        e.preventDefault();
         const mouseX = e.offsetX;
         const mouseY = e.offsetY;
         const zoomingIn = e.deltaY < 0;
@@ -314,8 +306,14 @@ canvas.addEventListener('wheel', (e) => {
         });
 
         redrawCanvas();
+    } else {
+        // Kill any active inertia from drag
+        if (inertiaTween) inertiaTween.kill();
+        // Trackpad panning (smoothness is handled by the hardware/browser events usually)
+        // Direct application provides 1:1 feel for trackpads
+        applyPan(-e.deltaX, -e.deltaY);
     }
-});
+}, { passive: false });
 
 canvas.addEventListener('mousedown', (e) => {
     handleMouseDown(e);
@@ -425,49 +423,33 @@ function isWithinEraserRadius(x, y, element) {
 }
 
 function handleMouseDown(e) {
+    const clickedX = e.offsetX;
+    const clickedY = e.offsetY;
+
     if (selectedTool === 'pointer') {
-        const clickedX = e.offsetX;
-        const clickedY = e.offsetY;
         selectedElement = getElementAtPosition(clickedX, clickedY);
 
         if (selectedElement) {
-            isDragging = true;
-            dragOffsetX = clickedX - selectedElement.x1;
-            dragOffsetY = clickedY - selectedElement.y1;
             canvas.style.cursor = 'move';
+            startElementDrag(e, selectedElement);
             return;
         }
     }
+
     if (selectedTool === 'select') {
-        const clickedX = e.offsetX;
-        const clickedY = e.offsetY;
         selectedElement = getElementAtPosition(clickedX, clickedY);
 
         if (selectedElement) {
             offsetX = clickedX - selectedElement.x1;
             offsetY = clickedY - selectedElement.y1;
         } else {
-            isPanning = true;
-            startPanX = e.clientX;
-            startPanY = e.clientY;
-        }
-    } else if (selectedTool === 'pointer') {
-        const clickedX = e.offsetX;
-        const clickedY = e.offsetY;
-        selectedElement = getElementAtPosition(clickedX, clickedY);
-
-        if (selectedElement && (selectedElement.type === 'rectangle' || selectedElement.type === 'circle' || selectedElement.type === 'triangle' || selectedElement.type === 'pentagon' || selectedElement.type === 'hexagon' || selectedElement.type === 'star' || selectedElement.type === 'line' || selectedElement.type === 'diamond')) {
-            isDragging = true;
-            dragOffsetX = clickedX - selectedElement.x1;
-            dragOffsetY = clickedY - selectedElement.y1;
+            startPan(e);
         }
     } else if (selectedTool === 'arrow') {
         isDrawing = true;
         startX = e.offsetX;
         startY = e.offsetY;
     } else if (selectedTool === 'fill-color') {
-        const clickedX = e.offsetX;
-        const clickedY = e.offsetY;
         const elementToFill = getElementAtPosition(clickedX, clickedY);
 
         if (elementToFill) {
@@ -479,70 +461,23 @@ function handleMouseDown(e) {
             document.getElementById('pointer').click();
         }
         return;
-    } else {
+    } else if (selectedTool !== 'pointer') { // Prevent starting drawing if in pointer mode but missed an element
         startDrawing(e);
     }
+    
     if (selectedTool === 'clear') {
         clearStickyNotes();
     }
 }
 
 function handleMouseMove(e) {
-    if (isDragging && selectedTool === 'pointer' && selectedElement) {
-        const newX = e.offsetX;
-        const newY = e.offsetY;
-
-        // Calculate the movement delta
-        const dx = newX - dragOffsetX - selectedElement.x1;
-        const dy = newY - dragOffsetY - selectedElement.y1;
-
-        // Move both points for all shape types
-        selectedElement.x1 += dx;
-        selectedElement.y1 += dy;
-        selectedElement.x2 += dx;
-        selectedElement.y2 += dy;
-
-        redrawCanvas();
+    if (selectedElement && isDragging && selectedTool === 'pointer') {
+        updateElementDrag(e);
         return;
     }
-    if (selectedElement) {
-        const newX = e.offsetX;
-        const newY = e.offsetY;
 
-        if (selectedTool === 'pointer' && isDragging) {
-            // Calculate the movement delta
-            const dx = newX - dragOffsetX - selectedElement.x1;
-            const dy = newY - dragOffsetY - selectedElement.y1;
-
-            // Set target position for smooth animation
-            targetPos = {
-                x: selectedElement.x1 + dx,
-                y: selectedElement.y1 + dy
-            };
-
-            if (!isAnimating) {
-                isAnimating = true;
-                lastTimestamp = performance.now();
-                animateMove();
-            }
-        } else {
-            // ...existing mouse move handling...
-        }
-    } else if (isPanning) {
+    if (isPanning) {
         pan(e);
-    } else if (isDragging && selectedTool === 'pointer') {
-        const newX = e.offsetX;
-        const newY = e.offsetY;
-
-        const moveX = newX - dragOffsetX;
-        const moveY = newY - dragOffsetY;
-
-        selectedElement.x1 = moveX;
-        selectedElement.y1 = moveY;
-        selectedElement.x2 = moveX + (selectedElement.x2 - selectedElement.x1);
-        selectedElement.y2 = moveY + (selectedElement.y2 - selectedElement.y1);
-
-        redrawCanvas();
     } else if (isDrawing && selectedTool === 'arrow') {
         redrawCanvas();
         const context = canvas.getContext('2d');
@@ -552,51 +487,23 @@ function handleMouseMove(e) {
     }
 }
 
-function animateMove() {
-    const currentTime = performance.now();
-    const elapsed = currentTime - lastTimestamp;
-    const progress = Math.min(elapsed / ANIMATION_DURATION, 1);
 
-    // Calculate intermediate position
-    const currentX = selectedElement.x1 + (targetPos.x - selectedElement.x1) * progress;
-    const currentY = selectedElement.y1 + (targetPos.y - selectedElement.y1) * progress;
-
-    // Move the element
-    const dx = currentX - selectedElement.x1;
-    const dy = currentY - selectedElement.y1;
-
-    selectedElement.x1 = currentX;
-    selectedElement.y1 = currentY;
-    if (selectedElement.x2 !== undefined) selectedElement.x2 += dx;
-    if (selectedElement.y2 !== undefined) selectedElement.y2 += dy;
-
-    redrawCanvas();
-
-    if (progress < 1) {
-        animationFrameId = requestAnimationFrame(animateMove);
-    } else {
-        isAnimating = false;
-        cancelAnimationFrame(animationFrameId);
-    }
-}
 
 function handleMouseUp(e) {
     if (isDragging && selectedTool === 'pointer') {
-        isDragging = false;
+        endElementDrag();
         selectedElement = null;
         saveState();
         updateCursorStyle();
         return;
     }
-    if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-        isAnimating = false;
-    }
+    // ... rest of function
 
     if (selectedElement) {
         selectedElement = null;
     } else if (isPanning) {
         isPanning = false;
+        handlePanInertia();
     } else if (isDragging && selectedTool === 'pointer') {
         isDragging = false;
         saveState(); // Save state after dragging completes
@@ -1004,20 +911,6 @@ function drawSmoothCircle(ctx, x1, y1, x2, y2, options) {
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.stroke();
-}
-
-function pan(e) {
-    const dx = (e.clientX - startPanX) / 2;
-    const dy = (e.clientY - startPanY) / 2;
-    elements.forEach(element => {
-        element.x1 += dx;
-        element.y1 += dy;
-        if (element.x2 !== undefined) element.x2 += dx;
-        if (element.y2 !== undefined) element.y2 += dy;
-    });
-    startPanX = e.clientX;
-    startPanY = e.clientY;
-    redrawCanvas();
 }
 
 function showAngle(x1, y1, x2, y2) {
